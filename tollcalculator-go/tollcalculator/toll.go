@@ -2,6 +2,7 @@ package tollcalculator
 
 import (
 	"fmt"
+	"slices"
 	"time"
 )
 
@@ -33,7 +34,13 @@ func (t FeeInterval) Contain(c time.Duration) bool {
 	return t.Start <= c && c < t.End
 }
 
-func NewTimeInterval(start, end string, fee int) (FeeInterval, error) {
+type TollCalculator struct {
+	intervals       []FeeInterval
+	gracePeriod     string
+	holidayProvider func(time.Time) bool
+}
+
+func newTimeInterval(start, end string, fee int) (FeeInterval, error) {
 	s, err := time.ParseDuration(start)
 
 	if err != nil {
@@ -49,7 +56,49 @@ func NewTimeInterval(start, end string, fee int) (FeeInterval, error) {
 	return FeeInterval{Start: s, End: e, Fee: fee}, nil
 }
 
-func GetTollFees(passes []time.Time, v VehicleType) (int, error) {
+// Returns a new TollCalculator using the provided holidayProvider implementation.
+func NewTollCalculator(holidayProvider func(time.Time) bool) (TollCalculator, error) {
+	tc := TollCalculator{
+		gracePeriod:     "1h",
+		holidayProvider: holidayProvider,
+	}
+	specs := []FeeSpec{
+		{Start: "0h", End: "6h", Fee: 0},
+		{Start: "6h", End: "6h30m", Fee: 8},
+		{Start: "6h30m", End: "7h", Fee: 13},
+		{Start: "7h", End: "8h", Fee: 18},
+		{Start: "8h", End: "8h30m", Fee: 13},
+		{Start: "8h30m", End: "15h", Fee: 8},
+		{Start: "15h", End: "15h30m", Fee: 13},
+		{Start: "15h30m", End: "17h", Fee: 18},
+		{Start: "17h", End: "18h", Fee: 13},
+		{Start: "18h", End: "18h30m", Fee: 8},
+		{Start: "18h30m", End: "24h", Fee: 0},
+	}
+
+	intervals := []FeeInterval{}
+
+	for _, spec := range specs {
+		i, err := newTimeInterval(spec.Start, spec.End, spec.Fee)
+
+		if err != nil {
+			return TollCalculator{}, err
+		}
+
+		intervals = append(intervals, i)
+	}
+
+	tc.intervals = intervals
+
+	return tc, nil
+}
+
+// Calculates total tolls attributable to a vehicle type given an array of passes.
+func (tc TollCalculator) GetTollFees(passes []time.Time, v VehicleType) (int, error) {
+
+	slices.SortFunc(passes, func(a, b time.Time) int {
+		return a.Compare(b)
+	})
 
 	if len(passes) == 0 {
 		return 0, nil
@@ -59,12 +108,12 @@ func GetTollFees(passes []time.Time, v VehicleType) (int, error) {
 	pending := 0
 	total := 0
 	for _, pass := range passes {
-		fee, err := getTollFee(pass, v)
+		fee, err := tc.getTollFee(pass, v)
 		if err != nil {
 			return 0, err
 		}
 
-		grace, err := time.ParseDuration("1h")
+		grace, err := time.ParseDuration(tc.gracePeriod)
 
 		if err != nil {
 			return 0, err
@@ -73,7 +122,7 @@ func GetTollFees(passes []time.Time, v VehicleType) (int, error) {
 		if start.Add(grace).After(pass) {
 			// still in 1 hour period
 		} else {
-			// 1hr has passed.
+			// grace period has passed.
 			total = total + pending
 			pending = 0
 			start = pass
@@ -93,49 +142,22 @@ func GetTollFees(passes []time.Time, v VehicleType) (int, error) {
 	return total, nil
 }
 
-func getTollFee(t time.Time, v VehicleType) (int, error) {
+func (tc TollCalculator) getTollFee(t time.Time, v VehicleType) (int, error) {
 	isTollFree, err := isTollFreeVehicle(v)
 
 	if err != nil {
 		return 0, err
 	}
 
-	if isTollFreeDate(t) || isTollFree {
+	if tc.isTollFreeDate(t) || isTollFree {
 		return 0, nil
-	}
-
-	// this could be sent from Json or similar.
-	specs := []FeeSpec{
-		FeeSpec{Start: "0h", End: "6h", Fee: 0},
-		FeeSpec{Start: "6h", End: "6h30m", Fee: 8},
-		FeeSpec{Start: "6h30m", End: "7h", Fee: 13},
-		FeeSpec{Start: "7h", End: "8h", Fee: 18},
-		FeeSpec{Start: "8h", End: "8h30m", Fee: 13},
-		FeeSpec{Start: "8h30m", End: "15h", Fee: 8},
-		FeeSpec{Start: "15h", End: "15h30m", Fee: 13},
-		FeeSpec{Start: "15h30m", End: "17h", Fee: 18},
-		FeeSpec{Start: "17h", End: "18h", Fee: 13},
-		FeeSpec{Start: "18h", End: "18h30m", Fee: 8},
-		FeeSpec{Start: "18h30m", End: "24h", Fee: 0},
-	}
-
-	intervals := []FeeInterval{}
-
-	for _, spec := range specs {
-		i, err := NewTimeInterval(spec.Start, spec.End, spec.Fee)
-
-		if err != nil {
-			return 0, err
-		}
-
-		intervals = append(intervals, i)
 	}
 
 	midnight := time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, t.Location())
 
 	dur := t.Sub(midnight)
 
-	for _, interval := range intervals {
+	for _, interval := range tc.intervals {
 		if interval.Contain(dur) {
 			return interval.Fee, nil
 		}
@@ -144,7 +166,7 @@ func getTollFee(t time.Time, v VehicleType) (int, error) {
 	return 0, nil
 }
 
-func isTollFreeDate(t time.Time) bool {
+func (tc TollCalculator) isTollFreeDate(t time.Time) bool {
 	return t.Weekday() == time.Saturday || t.Weekday() == time.Sunday
 }
 
